@@ -1,0 +1,98 @@
+# Keeps this fork current with googleapis/release-please without touching the
+# pull request branch by hand:
+#   - `main` mirrors upstream main (fast-forward only; this branch is never on it).
+#   - `feat/pull-request-group` (googleapis/release-please#2904) is rebased onto
+#     upstream main whenever it falls behind, tested, and force-pushed with a
+#     lease when the rebase is clean.
+#   - A rebase conflict opens one issue here and leaves the branch alone.
+# This branch is the fork's default only so the schedule runs; it carries
+# nothing else.
+name: Sync with upstream
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/googleapis/release-please.git
+  PR_BRANCH: feat/pull-request-group
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Mirror main from upstream
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream main
+          # A plain push refuses anything that is not a fast-forward, which is
+          # the point: main must never carry commits of its own.
+          git push origin upstream/main:refs/heads/main
+
+      - name: Rebase the pull request branch
+        id: rebase
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --quiet origin "$PR_BRANCH"
+          git checkout -q -B "$PR_BRANCH" "origin/$PR_BRANCH"
+          behind=$(git rev-list --count "$PR_BRANCH..upstream/main")
+          echo "behind upstream main by $behind commit(s)"
+          if [ "$behind" -eq 0 ]; then
+            echo "result=current" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git rebase --quiet upstream/main; then
+            echo "result=rebased" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U | tee conflicts.txt
+            git rebase --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.rebase.outputs.result == 'rebased'
+        with:
+          node-version: 22
+
+      - name: Test the rebased branch
+        if: steps.rebase.outputs.result == 'rebased'
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+      - name: Push the rebased branch
+        if: steps.rebase.outputs.result == 'rebased'
+        run: git push --force-with-lease origin "$PR_BRANCH"
+
+      - name: Open an issue on conflict
+        if: steps.rebase.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Rebase of $PR_BRANCH onto upstream main conflicts"
+          if gh issue list --state open --search "$title in:title" --json number --jq 'length' | grep -qv '^0$'; then
+            echo "an open issue already reports this"
+            exit 0
+          fi
+          {
+            echo "The daily sync could not rebase \`$PR_BRANCH\` onto upstream main cleanly. Conflicting files:"
+            echo
+            sed 's/^/- /' conflicts.txt
+            echo
+            echo "Rebase by hand, then the next run resumes."
+          } > body.md
+          gh issue create --title "$title" --body-file body.md
