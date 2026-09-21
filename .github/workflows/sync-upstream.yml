@@ -5,6 +5,11 @@
 #     upstream main whenever it falls behind, tested, and force-pushed with a
 #     lease when the rebase is clean.
 #   - A rebase conflict opens one issue here and leaves the branch alone.
+#   - Upstream tags are mirrored, and every upstream release from
+#     FIRST_VERSION on gets a patched counterpart `vX.Y.Z-pr<PR>.N` (the tag
+#     plus the pull request's patch, tested) with the CLI bundled by ncc and
+#     attached to a GitHub release, so a consumer can move between upstream
+#     `X.Y.Z` and the patched build by adding or dropping the suffix.
 # This branch is the fork's default only so the schedule runs; it carries
 # nothing else.
 name: Sync with upstream
@@ -25,6 +30,9 @@ concurrency:
 env:
   UPSTREAM: https://github.com/googleapis/release-please.git
   PR_BRANCH: feat/pull-request-group
+  PR_NUMBER: '2904'
+  # Upstream releases older than this get no counterpart.
+  FIRST_VERSION: 17.11.2
 
 jobs:
   sync:
@@ -96,3 +104,97 @@ jobs:
             echo "Rebase by hand, then the next run resumes."
           } > body.md
           gh issue create --title "$title" --body-file body.md
+
+  patched-releases:
+    needs: sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Mirror upstream tags
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream main --tags
+          # Existing tags are no-ops; a tag that already exists here with a
+          # different object is rejected, which is the right outcome.
+          git push --quiet origin --tags
+
+      - name: Pick upstream releases that lack a counterpart for the current patch
+        id: pick
+        run: |
+          git fetch --quiet origin "$PR_BRANCH"
+          base=$(git merge-base upstream/main "origin/$PR_BRANCH")
+          patch_id=$(git diff "$base" "origin/$PR_BRANCH" -- src schemas | git patch-id --stable | cut -d' ' -f1 | cut -c1-12)
+          echo "patch-id of $PR_BRANCH: $patch_id"
+          todo=""
+          for t in $(git tag --list 'v[0-9]*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'); do
+            v="${t#v}"
+            # stop at the first release below the floor (the list is newest first)
+            if [ "$(printf '%s\n%s\n' "$FIRST_VERSION" "$v" | sort -V | head -1)" != "$FIRST_VERSION" ]; then
+              break
+            fi
+            latest=$(git tag --list "${t}-pr${PR_NUMBER}.*" --sort=-v:refname | head -1)
+            if [ -n "$latest" ]; then
+              built=$(git tag -l --format='%(contents:subject)' "$latest" | sed -n 's/.*patch-id=\([0-9a-f]*\).*/\1/p')
+              if [ "$built" = "$patch_id" ]; then
+                continue
+              fi
+              n=$(( ${latest##*.} + 1 ))
+            else
+              n=1
+            fi
+            todo="$todo ${t}:${n}"
+          done
+          echo "to build:${todo:- nothing}"
+          echo "todo=${todo}" >> "$GITHUB_OUTPUT"
+          echo "patch_id=${patch_id}" >> "$GITHUB_OUTPUT"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.pick.outputs.todo != ''
+        with:
+          node-version: 22
+
+      - name: Build, test, bundle and release each counterpart
+        if: steps.pick.outputs.todo != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PATCH_ID: ${{ steps.pick.outputs.patch_id }}
+          BASE: ${{ steps.pick.outputs.base }}
+          TODO: ${{ steps.pick.outputs.todo }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          patch_commits=$(git rev-list --reverse "$BASE..origin/$PR_BRANCH")
+          failed=""
+          for item in $TODO; do
+            t="${item%%:*}"; n="${item##*:}"; name="${t}-pr${PR_NUMBER}.${n}"
+            echo "::group::${name}"
+            git checkout -q --detach "$t"
+            if ! git cherry-pick --no-edit $patch_commits; then
+              git cherry-pick --abort
+              echo "::warning::${name}: the patch does not apply to ${t}; skipped"
+              failed="$failed $name"; echo "::endgroup::"; continue
+            fi
+            npm ci --no-audit --no-fund
+            npm test
+            rm -rf dist && npx --yes @vercel/ncc@0.38.3 build build/src/bin/release-please.js -o dist
+            node dist/index.js --version | grep -qx "${t#v}"
+            asset="release-please-cli-${name#v}.tar.gz"
+            tar -czf "$asset" -C dist .
+            sha256sum "$asset" > "$asset.sha256"
+            git tag -a "$name" -m "upstream ${t} + googleapis/release-please#${PR_NUMBER} patch-id=${PATCH_ID}"
+            git push --quiet origin "$name"
+            gh release create "$name" "$asset" "$asset.sha256" \
+              --title "$name" \
+              --notes "Upstream ${t} plus googleapis/release-please#${PR_NUMBER} (patch-id ${PATCH_ID}). The asset is the CLI bundled by ncc: run \`node index.js release-pr ...\` / \`node index.js github-release ...\` after extracting."
+            rm -f "$asset" "$asset.sha256"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::patch did not apply to:${failed}"
+            exit 1
+          fi
