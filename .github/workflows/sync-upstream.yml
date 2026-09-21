@@ -217,7 +217,9 @@ jobs:
             npm ci --no-audit --no-fund
             npm test
             rm -rf dist && npx --yes @vercel/ncc@0.38.3 build build/src/bin/release-please.js -o dist
-            node dist/index.js --version | grep -qx "${t#v}"
+            # yargs reports the nearest package.json's version; give the bundle its own.
+            printf '{"name":"release-please","version":"%s","private":true}\n' "${t#v}" > dist/package.json
+            (cd dist && node index.js --version | grep -qx "${t#v}")
             asset="release-please-cli-${name#v}.tar.gz"
             tar -czf "$asset" -C dist .
             sha256sum "$asset" > "$asset.sha256"
