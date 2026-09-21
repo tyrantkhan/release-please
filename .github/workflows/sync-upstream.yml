@@ -5,6 +5,8 @@
 #     upstream main whenever it falls behind, tested, and force-pushed with a
 #     lease when the rebase is clean.
 #   - A rebase conflict opens one issue here and leaves the branch alone.
+#   - Pushes use a write deploy key (secret SYNC_DEPLOY_KEY): the workflow
+#     token may not push refs that change workflow files, and mirrors do.
 #   - Upstream tags are mirrored, and every upstream release from
 #     FIRST_VERSION on gets a patched counterpart `vX.Y.Z-pr<PR>.N` (the tag
 #     plus the pull request's patch, tested) with the CLI bundled by ncc and
@@ -41,6 +43,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Push over SSH with the write deploy key
+        # The workflow token may not push refs that add or change workflow
+        # files, which upstream tags and main do; a deploy key may.
+        env:
+          SYNC_DEPLOY_KEY: ${{ secrets.SYNC_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SYNC_DEPLOY_KEY" > ~/.ssh/sync_key && chmod 600 ~/.ssh/sync_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git config core.sshCommand "ssh -i ~/.ssh/sync_key -o IdentitiesOnly=yes"
+          git remote set-url --push origin git@github.com:${GITHUB_REPOSITORY}.git
 
       - name: Mirror main from upstream
         run: |
@@ -112,6 +126,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Push over SSH with the write deploy key
+        # The workflow token may not push refs that add or change workflow
+        # files, which upstream tags and main do; a deploy key may.
+        env:
+          SYNC_DEPLOY_KEY: ${{ secrets.SYNC_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SYNC_DEPLOY_KEY" > ~/.ssh/sync_key && chmod 600 ~/.ssh/sync_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git config core.sshCommand "ssh -i ~/.ssh/sync_key -o IdentitiesOnly=yes"
+          git remote set-url --push origin git@github.com:${GITHUB_REPOSITORY}.git
 
       - name: Mirror upstream tags
         run: |
