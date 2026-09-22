@@ -7,13 +7,14 @@
 #   - A rebase conflict opens one issue here and leaves the branch alone.
 #   - Pushes use a write deploy key (secret SYNC_DEPLOY_KEY): the workflow
 #     token may not push refs that change workflow files, and mirrors do.
-#   - Upstream tags are mirrored, and every upstream release from
-#     FIRST_VERSION on gets a patched counterpart `vX.Y.Z-pr<PR>.N` (the tag
-#     plus the pull request's patch, tested) with the CLI bundled by ncc and
-#     attached to a GitHub release. The tag's tree also carries the compiled
-#     output, so `npm install github:<fork>#vX.Y.Z-pr<PR>.N` is a drop-in for
-#     `release-please@X.Y.Z`; a consumer moves between upstream and the patched
-#     build by adding or dropping the suffix.
+#   - Upstream tags below FIRST_VERSION are mirrored as they are. From
+#     FIRST_VERSION on, the fork's `vX.Y.Z` tag is upstream `vX.Y.Z` plus the
+#     pull request's patch, tested, with the compiled output committed on the
+#     tag (so `npm install github:<fork>#vX.Y.Z` is a drop-in for
+#     `release-please@X.Y.Z`) and the CLI bundled by ncc on a release of the
+#     same name. Switching between upstream and the fork changes only the
+#     source, never the version. A version is built once; dispatch with
+#     `rebuild` to redo one after the patch changes.
 # This branch is the fork's default only so the schedule runs; it carries
 # nothing else.
 name: Sync with upstream
@@ -22,6 +23,11 @@ on:
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Upstream version to rebuild from scratch, e.g. v17.11.2 (its tag and release are replaced)
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -35,7 +41,8 @@ env:
   UPSTREAM: https://github.com/googleapis/release-please.git
   PR_BRANCH: feat/pull-request-group
   PR_NUMBER: '2904'
-  # Upstream releases older than this get no counterpart.
+  # Upstream releases from this version on are rebuilt with the patch under
+  # the same tag; older ones are mirrored unchanged.
   FIRST_VERSION: 17.11.2
 
 jobs:
@@ -141,46 +148,51 @@ jobs:
           git config core.sshCommand "ssh -i ~/.ssh/sync_key -o IdentitiesOnly=yes"
           git remote set-url --push origin "git@github.com:${GITHUB_REPOSITORY}.git"
 
-      - name: Mirror upstream tags
+      - name: Mirror upstream tags below FIRST_VERSION
         run: |
           git remote add upstream "$UPSTREAM"
-          git fetch --quiet upstream main --tags
-          # Existing tags are no-ops; a tag that already exists here with a
-          # different object is rejected, which is the right outcome.
-          git push --quiet origin --tags
+          git fetch --quiet upstream main
+          # Upstream tags land in their own namespace so the fork's patched tags
+          # are never overwritten by a mirror.
+          git fetch --quiet upstream '+refs/tags/*:refs/upstream-tags/*'
+          refspecs=""
+          for r in $(git for-each-ref --format='%(refname)' refs/upstream-tags); do
+            t="${r#refs/upstream-tags/}"
+            v="${t#v}"
+            # keep only versions strictly below the floor
+            if [ "$(printf '%s\n%s\n' "$v" "$FIRST_VERSION" | sort -V | head -1)" = "$v" ] && [ "$v" != "$FIRST_VERSION" ]; then
+              refspecs="$refspecs $r:refs/tags/$t"
+            fi
+          done
+          # shellcheck disable=SC2086 # one refspec per word by construction
+          git push --quiet origin $refspecs
 
-      - name: Pick upstream releases that lack a counterpart for the current patch
+      - name: Pick versions from FIRST_VERSION on that the fork has not patched
         id: pick
         env:
-          GH_TOKEN: ${{ github.token }}
+          REBUILD: ${{ inputs.rebuild }}
         run: |
           git fetch --quiet origin "$PR_BRANCH"
           base=$(git merge-base upstream/main "origin/$PR_BRANCH")
           patch_id=$(git diff "$base" "origin/$PR_BRANCH" -- src schemas | git patch-id --stable | cut -d' ' -f1 | cut -c1-12)
           echo "patch-id of $PR_BRANCH: $patch_id"
           todo=""
-          for t in $(git tag --list 'v[0-9]*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'); do
+          for r in $(git for-each-ref --format='%(refname)' --sort=-v:refname refs/upstream-tags); do
+            t="${r#refs/upstream-tags/}"
             v="${t#v}"
-            # stop at the first release below the floor (the list is newest first)
             if [ "$(printf '%s\n%s\n' "$FIRST_VERSION" "$v" | sort -V | head -1)" != "$FIRST_VERSION" ]; then
               break
             fi
-            latest=$(git tag --list "${t}-pr${PR_NUMBER}.*" --sort=-v:refname | head -1)
-            if [ -n "$latest" ]; then
-              built=$(git tag -l --format='%(contents:subject)' "$latest" | sed -n 's/.*patch-id=\([0-9a-f]*\).*/\1/p')
-              if [ "$built" = "$patch_id" ]; then
-                # Same patch already tagged; finish it only if its release is missing.
-                if gh release view "$latest" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-                  continue
-                fi
-                n=${latest##*.}
-              else
-                n=$(( ${latest##*.} + 1 ))
-              fi
-            else
-              n=1
+            if [ "$t" = "$REBUILD" ]; then
+              todo="$todo $t"
+              continue
             fi
-            todo="$todo ${t}:${n}"
+            # A fork tag whose message names a patch-id is one of our builds.
+            if git rev-parse -q --verify "refs/tags/$t" >/dev/null \
+               && git tag -l --format='%(contents:subject)' "$t" | grep -q 'patch-id='; then
+              continue
+            fi
+            todo="$todo $t"
           done
           echo "to build:${todo:- nothing}"
           {
@@ -194,7 +206,7 @@ jobs:
         with:
           node-version: 22
 
-      - name: Build, test, bundle and release each counterpart
+      - name: Build, test, tag and release each version
         if: steps.pick.outputs.todo != ''
         env:
           GH_TOKEN: ${{ github.token }}
@@ -207,39 +219,35 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           mapfile -t patch_commits < <(git rev-list --reverse "$BASE..origin/$PR_BRANCH")
           failed=""
-          for item in $TODO; do
-            t="${item%%:*}"; n="${item##*:}"; name="${t}-pr${PR_NUMBER}.${n}"
-            echo "::group::${name}"
-            git checkout -q --detach "$t"
+          for t in $TODO; do
+            v="${t#v}"
+            echo "::group::${t}"
+            git checkout -q --detach "refs/upstream-tags/$t"
             if ! git cherry-pick --no-edit "${patch_commits[@]}"; then
               git cherry-pick --abort
-              echo "::warning::${name}: the patch does not apply to ${t}; skipped"
-              failed="$failed $name"; echo "::endgroup::"; continue
+              echo "::warning::${t}: the patch does not apply; skipped"
+              failed="$failed $t"; echo "::endgroup::"; continue
             fi
             npm ci --no-audit --no-fund
             npm test
             # Commit the compiled output on the tag so the tag installs like the
-            # npm package: `npm install github:<fork>#vX.Y.Z-pr<PR>.N` is a drop-in
-            # for `release-please@X.Y.Z` (the package has no prepare script).
+            # npm package (the package has no prepare script).
             find build/src -name '*.map' -delete
             git add -f build/src
-            git commit -q -m "build: compiled output for ${name}"
+            git commit -q -m "build: compiled output for ${t}"
             rm -rf dist && npx --yes @vercel/ncc@0.38.3 build build/src/bin/release-please.js -o dist
             # yargs reports the nearest package.json's version; give the bundle its own.
-            printf '{"name":"release-please","version":"%s","private":true}\n' "${t#v}" > dist/package.json
-            (cd dist && node index.js --version | grep -qx "${t#v}")
-            asset="release-please-cli-${name#v}.tar.gz"
+            printf '{"name":"release-please","version":"%s","private":true}\n' "$v" > dist/package.json
+            (cd dist && node index.js --version | grep -qx "$v")
+            asset="release-please-cli-${v}.tar.gz"
             tar -czf "$asset" -C dist .
             sha256sum "$asset" > "$asset.sha256"
-            if git rev-parse -q --verify "refs/tags/$name" >/dev/null; then
-              echo "tag $name exists; creating its release"
-            else
-              git tag -a "$name" -m "upstream ${t} + googleapis/release-please#${PR_NUMBER} patch-id=${PATCH_ID}"
-              git push --quiet origin "$name"
-            fi
-            gh release create "$name" "$asset" "$asset.sha256" --repo "$GITHUB_REPOSITORY" \
-              --title "$name" \
-              --notes "Upstream ${t} plus googleapis/release-please#${PR_NUMBER} (patch-id ${PATCH_ID}). The asset is the CLI bundled by ncc: run \`node index.js release-pr ...\` / \`node index.js github-release ...\` after extracting."
+            git tag -f -a "$t" -m "upstream ${t} + googleapis/release-please#${PR_NUMBER} patch-id=${PATCH_ID}"
+            git push --quiet --force origin "refs/tags/$t"
+            gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+            gh release create "$t" "$asset" "$asset.sha256" --repo "$GITHUB_REPOSITORY" \
+              --title "$t" \
+              --notes "Upstream ${t} plus googleapis/release-please#${PR_NUMBER} (patch-id ${PATCH_ID}). The tag installs like release-please@${v} (\`npm install github:${GITHUB_REPOSITORY}#${t}\`); the asset is the CLI bundled by ncc: extract, then \`node index.js release-pr ...\` and \`node index.js github-release ...\`."
             rm -f "$asset" "$asset.sha256"
             echo "::endgroup::"
           done
