@@ -10,8 +10,10 @@
 #   - Upstream tags are mirrored, and every upstream release from
 #     FIRST_VERSION on gets a patched counterpart `vX.Y.Z-pr<PR>.N` (the tag
 #     plus the pull request's patch, tested) with the CLI bundled by ncc and
-#     attached to a GitHub release, so a consumer can move between upstream
-#     `X.Y.Z` and the patched build by adding or dropping the suffix.
+#     attached to a GitHub release. The tag's tree also carries the compiled
+#     output, so `npm install github:<fork>#vX.Y.Z-pr<PR>.N` is a drop-in for
+#     `release-please@X.Y.Z`; a consumer moves between upstream and the patched
+#     build by adding or dropping the suffix.
 # This branch is the fork's default only so the schedule runs; it carries
 # nothing else.
 name: Sync with upstream
@@ -216,6 +218,12 @@ jobs:
             fi
             npm ci --no-audit --no-fund
             npm test
+            # Commit the compiled output on the tag so the tag installs like the
+            # npm package: `npm install github:<fork>#vX.Y.Z-pr<PR>.N` is a drop-in
+            # for `release-please@X.Y.Z` (the package has no prepare script).
+            find build/src -name '*.map' -delete
+            git add -f build/src
+            git commit -q -m "build: compiled output for ${name}"
             rm -rf dist && npx --yes @vercel/ncc@0.38.3 build build/src/bin/release-please.js -o dist
             # yargs reports the nearest package.json's version; give the bundle its own.
             printf '{"name":"release-please","version":"%s","private":true}\n' "${t#v}" > dist/package.json
